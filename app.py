@@ -11,6 +11,7 @@ import re
 import base64
 import zipfile
 import io
+from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 
 # Hardcoded Agent ID
@@ -80,8 +81,9 @@ st.markdown("""
     
     .main-header p {
         color: rgba(255, 255, 255, 0.9);
-        margin: 0.25rem 0 0 0;
-        font-size: 0.95rem;
+        margin: 0.5rem 0 0 0;
+        font-size: 1.2rem;
+        text-align: right;
     }
     
     /* Step cards */
@@ -641,7 +643,10 @@ def main():
             """ + render_rsm_logo() + """
         </div>
         <div class="main-header">
-            <h1>Data Intake and Labelling Agent</h1>
+            <div style="text-align: right;">
+                <h1>Data Intake and Labelling Agent</h1>
+                <h3>Phase-I</h3>
+            </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1045,7 +1050,35 @@ def main():
             for file_name, file_data in st.session_state.files_data.items():
                 # Only show if file has any processing results
                 if file_data.get('document_id'):
-                    with st.expander(f"📄 **{file_name}** - Processing Steps", expanded=False):
+                    # Determine file status for color coding
+                    is_success = file_data.get('status') == 'step3_complete' or file_data.get('labeling_result')
+                    is_failed = file_data.get('status') == 'failed' or file_data.get('errors')
+                    
+                    # Set color based on status
+                    if is_success:
+                        status_color = "#28a745"  # Green for success
+                        status_icon = "✅"
+                    elif is_failed:
+                        status_color = "#dc3545"  # Red for failed
+                        status_icon = "❌"
+                    else:
+                        status_color = "#6c757d"  # Gray for in progress
+                        status_icon = "⏳"
+                    
+                    # Create styled expander header with color coding
+                    st.markdown(f"""
+                    <style>
+                    .streamlit-expanderHeader {{
+                        background-color: {status_color} !important;
+                        color: white !important;
+                        border-radius: 4px;
+                        padding: 0.5rem 1rem !important;
+                    }}
+                    </style>
+                    """, unsafe_allow_html=True)
+                                        
+                    expander_label = f"{status_icon} **{file_name}** - Processing Steps"
+                    with st.expander(expander_label, expanded=False):
                         # Step 1 Results
                         if file_data.get('integrity_status') or file_data.get('markdown_content'):
                             st.markdown("#### Step 1: Integrity Check & Document Conversion")
@@ -1091,6 +1124,9 @@ def main():
                             st.error("**Errors encountered for this file:**")
                             for error in file_data['errors']:
                                 st.error(f"• {error}")
+                        
+                        # Close the colored border div
+                        st.markdown("</div>", unsafe_allow_html=True)
     
     # Show summary, download all, and detailed results whenever we have processed files
     # Show them both during active processing and after, but keep them stable on download clicks
@@ -1105,9 +1141,9 @@ def main():
         with col_sum1:
             st.metric("Total Files", total_files)
         with col_sum2:
-            st.metric("Completed", completed_files, delta=f"{completed_files}/{total_files}")
+            st.metric("Completed", completed_files)
         with col_sum3:
-            st.metric("Failed", failed_files, delta=f"{failed_files}/{total_files}" if failed_files > 0 else None)
+            st.metric("Failed", failed_files)
         
         # Get completed file names
         completed_file_names = [name for name, data in st.session_state.files_data.items() if data['status'] == 'step3_complete']
@@ -1125,17 +1161,6 @@ def main():
                 labeling_result = file_data.get('labeling_result')
                 
                 with st.expander(f"📄 **{file_name}** - Detailed Results", expanded=False):
-                    if classification_result:
-                        document_class = classification_result.get('documentClass', 'Unknown')
-                        probability = classification_result.get('probabilityScore', 0.0)
-                        
-                        st.markdown(f"""
-                        <div style="margin: 1rem 0 1.5rem 0;">
-                            <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Category</p>
-                            <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
-                            <p style="font-size: 0.9rem; color: #6b7280; margin: 0.25rem 0;">Confidence: {probability:.2%}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
                     
                     if labeling_result:
                         label_path = labeling_result.get('labelPath', 'N/A')
@@ -1174,7 +1199,7 @@ def main():
                                 # File is cached, show button immediately
                                 file_content, filename = st.session_state.cached_file_downloads[cache_key]
                                 st.download_button(
-                                    label=f"📥 Download {file_name}",
+                                    label=f"Download 📥",
                                     data=file_content,
                                     file_name=filename,
                                     mime="application/octet-stream",
@@ -1215,11 +1240,16 @@ def main():
                 
                 zip_buffer.seek(0)
                 
+                # Generate timestamp-based filename: dd-mm-yyyy:HH:MM:SS
+                # Note: Using hyphens instead of colons for Windows compatibility
+                timestamp = datetime.now().strftime("%d-%m-%Y_%H:%M:%S")
+                zip_filename = f"{timestamp}.zip"
+                
                 # Offer ZIP download
                 st.download_button(
                     label=f"Download All Files as ZIP ({len(ready_files)} files)",
                     data=zip_buffer.getvalue(),
-                    file_name="processed_documents.zip",
+                    file_name=zip_filename,
                     mime="application/zip",
                     use_container_width=True,
                     key="download_all_zip"
