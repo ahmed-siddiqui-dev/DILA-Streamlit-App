@@ -1184,6 +1184,47 @@ def main():
                                 # File not cached, show placeholder that will be replaced on next rerun
                                 st.info("💾 Preparing download...")
             
+            # Download All button (downloads all files as ZIP)
+            # Check if all files are ready to download
+            ready_files = []
+            for file_name in completed_file_names:
+                file_data = st.session_state.files_data[file_name]
+                classification_result = file_data.get('classification_result')
+                labeling_document_id = None
+                if classification_result:
+                    labeling_document_id = classification_result.get('documentId')
+                if not labeling_document_id:
+                    labeling_document_id = file_data.get('document_id')
+                
+                if labeling_document_id:
+                    cache_key = f"{labeling_document_id}_{file_name}"
+                    if cache_key in st.session_state.cached_file_downloads and st.session_state.cached_file_downloads[cache_key]:
+                        file_content, filename = st.session_state.cached_file_downloads[cache_key]
+                        ready_files.append((file_name, filename, file_content, labeling_document_id))
+            
+            if len(ready_files) > 1:
+                st.markdown("---")
+                st.markdown("### Download All Files")
+                
+                # Create ZIP file in memory
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                    for file_name, filename, file_content, labeling_document_id in ready_files:
+                        # Add each file to the ZIP with its original filename
+                        zip_file.writestr(filename, file_content)
+                
+                zip_buffer.seek(0)
+                
+                # Offer ZIP download
+                st.download_button(
+                    label=f"Download All Files as ZIP ({len(ready_files)} files)",
+                    data=zip_buffer.getvalue(),
+                    file_name="processed_documents.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    key="download_all_zip"
+                )
+            
             # Now download any missing files in the background (this will trigger a rerun)
             files_to_download = []
             for file_name in completed_file_names:
