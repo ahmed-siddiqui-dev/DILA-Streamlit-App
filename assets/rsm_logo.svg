@@ -1,0 +1,8 @@
+<svg width="120" height="40" xmlns="http://www.w3.org/2000/svg">
+    <!-- RSM Logo Bars -->
+    <rect x="0" y="0" width="12" height="12" fill="#718096" rx="2" opacity="0.9"/>
+    <rect x="16" y="0" width="20" height="12" fill="#48bb78" rx="2"/>
+    <rect x="40" y="0" width="32" height="12" fill="#4299e1" rx="2"/>
+    <!-- RSM Text - White for visibility on blue background -->
+    <text x="0" y="32" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="white">RSM</text>
+</svg>
