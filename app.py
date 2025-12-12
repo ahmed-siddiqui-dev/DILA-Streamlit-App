@@ -9,7 +9,7 @@ import json
 import os
 import re
 import base64
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 # Hardcoded Agent ID
 AGENT_ID = "69174f5b808a5f1b07561164"
@@ -211,6 +211,14 @@ if 'user_id' not in st.session_state:
     st.session_state.user_id = None
 if 'is_authenticated' not in st.session_state:
     st.session_state.is_authenticated = False
+if 'model_name' not in st.session_state:
+    st.session_state.model_name = ""
+if 'downloaded_file_data' not in st.session_state:
+    st.session_state.downloaded_file_data = None
+if 'downloaded_file_name' not in st.session_state:
+    st.session_state.downloaded_file_name = None
+if 'show_processing_steps' not in st.session_state:
+    st.session_state.show_processing_steps = False
 
 
 def display_success_with_icon(message: str):
@@ -504,6 +512,70 @@ def label_document(api_base_url: str, auth_token: str, document_id: str, documen
         raise Exception(str(e))
 
 
+def download_document(api_base_url: str, auth_token: str, agent_id: str, document_id: str, model_name: str, input_or_output: str) -> Tuple[bytes, str]:
+    """
+    Download document from the API
+    
+    Args:
+        api_base_url: Base URL of the API
+        auth_token: Authentication token
+        agent_id: Agent ID
+        document_id: Document ID (MongoDB ObjectId)
+        model_name: Model name (can be empty string)
+        input_or_output: Either "input" or "output"
+    
+    Returns:
+        tuple: (file_content_bytes, filename)
+    
+    Raises:
+        Exception: If download fails
+    """
+    try:
+        url = f"{api_base_url}/document/download/{agent_id}"
+        headers = {
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "documentId": document_id,
+            "modelName": model_name or "",
+            "inputOrOutput": input_or_output
+        }
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=120)
+        
+        if response.status_code == 200:
+            # Extract filename from Content-Disposition header
+            content_disposition = response.headers.get('Content-Disposition', '')
+            filename = 'download'
+            
+            if content_disposition:
+                # Parse filename from Content-Disposition header
+                # Format: attachment; filename={fileName}
+                filename_match = re.search(r'filename=(.+)', content_disposition)
+                if filename_match:
+                    filename = filename_match.group(1).strip('"\'')
+            
+            return response.content, filename
+        elif response.status_code == 404:
+            error_data = response.json() if response.headers.get('Content-Type', '').startswith('application/json') else {}
+            error_msg = error_data.get('message', 'File not found.')
+            raise Exception(error_msg)
+        elif response.status_code == 401:
+            error_data = response.json() if response.headers.get('Content-Type', '').startswith('application/json') else {}
+            error_msg = error_data.get('message', 'Unauthorized - Please check your authentication token')
+            raise Exception(error_msg)
+        else:
+            error_msg = extract_backend_error_message(response)
+            raise Exception(f"Download failed: {error_msg}")
+            
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Network error: {str(e)}")
+    except Exception as e:
+        raise Exception(str(e))
+
+
 def render_rsm_logo():
     """Render RSM logo - Prioritizes PNG, then JPG, falls back to SVG, then inline SVG"""
     assets_dir = os.path.join(os.path.dirname(__file__), 'assets')
@@ -615,6 +687,9 @@ def main():
             st.session_state.extracted_data = None
             st.session_state.classification_result = None
             st.session_state.labeling_result = None
+            st.session_state.downloaded_file_data = None
+            st.session_state.downloaded_file_name = None
+            st.session_state.show_processing_steps = False
             clear_errors()
             st.rerun()
     
@@ -679,6 +754,18 @@ def main():
         """)
     
     if process_button:
+        # Reset all states when starting new processing
+        st.session_state.document_id = None
+        st.session_state.integrity_status = None
+        st.session_state.markdown_content = None
+        st.session_state.extracted_data = None
+        st.session_state.classification_result = None
+        st.session_state.labeling_result = None
+        st.session_state.downloaded_file_data = None
+        st.session_state.downloaded_file_name = None
+        st.session_state.show_processing_steps = False
+        clear_errors()
+        
         if not uploaded_file:
             st.error("**Please upload a file first!**")
             return
@@ -687,7 +774,8 @@ def main():
             st.error("**Authentication required!**")
             return
         
-        clear_errors()
+        # Set show_processing_steps to True now that we're starting processing
+        st.session_state.show_processing_steps = True
         
         file_name = uploaded_file.name
         file_size = uploaded_file.size
@@ -705,10 +793,215 @@ def main():
                     file_name, file_size, file_extension, st.session_state.user_id
                 )
                 st.session_state.document_id = document_id
+                # Store model_name (currently empty string, but may be used later)
+                st.session_state.model_name = ""
             except Exception as e:
                 display_error(str(e), "Document Upload")
                 st.stop()
         
+        # Show processing steps during active processing
+        st.markdown("---")
+        st.markdown("### Processing Pipeline")
+        st.markdown("---")
+        
+        with st.container():
+                st.markdown("#### Step 1: Integrity Check & Document Conversion")
+                
+                st.markdown("##### 1.1 Integrity Check")
+                try:
+                    with st.spinner("Validating document structure and integrity..."):
+                        integrity_result = check_integrity(CORE_API_BASE_URL, st.session_state.auth_token, document_id)
+                        st.session_state.integrity_status = integrity_result
+                    
+                    status = integrity_result.get('status', '').lower()
+                    if status == 'valid' or status == 'v':
+                        display_success_with_icon("Document integrity check passed!")
+                    else:
+                        error_msg = integrity_result.get('message', 'Document validation failed')
+                        display_error(error_msg, "Integrity Check")
+                        st.warning("**Integrity check failed. Pipeline stopped.**")
+                        st.stop()
+                        
+                except Exception as e:
+                    display_error(str(e), "Integrity Check")
+                    st.stop()
+                
+                st.markdown("---")
+                
+                st.markdown("##### 1.2 Document Conversion")
+                try:
+                    with st.spinner("Converting document to Markdown format..."):
+                        conversion_result = convert_document(CORE_API_BASE_URL, st.session_state.auth_token, document_id)
+                        markdown_content = conversion_result.get('markdownContent', '')
+                        st.session_state.markdown_content = markdown_content
+                    
+                    if markdown_content:
+                        display_success_with_icon("Document converted to Markdown successfully!")
+                    else:
+                        raise Exception("No markdown content in response")
+                        
+                except Exception as e:
+                    display_error(str(e), "Document Conversion")
+                    st.stop()
+        
+        st.markdown("---")
+        
+        with st.container():
+                st.markdown("#### Step 2: Value Extraction & Document Classification")
+                
+                st.markdown("##### 2.1 Value Extraction")
+                try:
+                    with st.spinner("Extracting structured fields and metadata..."):
+                        # User-specified keys logic - commented out (using auto-extraction only)
+                        # user_keys_list = None
+                        # if extraction_mode == "user_specified" and user_keys_input:
+                        #     user_keys_list = [key.strip() for key in user_keys_input.split(',') if key.strip()]
+                        
+                        extraction_result = extract_values(
+                            CLASSIFICATION_API_BASE_URL, st.session_state.auth_token, markdown_content, 
+                            extraction_mode, None, document_id
+                        )
+                        st.session_state.extracted_data = extraction_result
+                    
+                    extracted_fields = extraction_result.get('extractedFields', {})
+                    client_metadata = extraction_result.get('clientMetadata', {})
+                    
+                    display_success_with_icon("Value extraction completed!")
+                        
+                except Exception as e:
+                    display_error(str(e), "Value Extraction")
+                    st.stop()
+                
+                st.markdown("---")
+                
+                st.markdown("##### 2.2 Document Classification")
+                try:
+                    with st.spinner("Classifying document using AI..."):
+                        classification_result = classify_document(
+                            CLASSIFICATION_API_BASE_URL, st.session_state.auth_token, extracted_fields, client_metadata, document_id
+                        )
+                        st.session_state.classification_result = classification_result
+                    
+                    document_class = classification_result.get('documentClass', 'Unknown')
+                    probability = classification_result.get('probabilityScore', 0.0)
+                    classification_document_id = classification_result.get('documentId', document_id)
+                    
+                    display_success_with_icon("Document classified successfully!")
+                    
+                    st.markdown(f"""
+                    <div style="margin: 1rem 0 1.5rem 0;">
+                        <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Category</p>
+                        <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                except Exception as e:
+                    display_error(str(e), "Document Classification")
+                    st.stop()
+        
+        st.markdown("---")
+        
+        with st.container():
+                st.markdown("#### Step 3: Labeling & Data Output")
+                try:
+                    classification_result = st.session_state.classification_result
+                    if not classification_result:
+                        raise Exception("Classification result not found")
+                    
+                    document_class = classification_result.get('documentClass', 'Unknown')
+                    probability = classification_result.get('probabilityScore', 0.0)
+                    
+                    labeling_document_id = classification_result.get('documentId')
+                    if not labeling_document_id:
+                        labeling_document_id = document_id
+                        if not labeling_document_id:
+                            raise Exception("Document ID not found")
+                    
+                    extraction_result = st.session_state.extracted_data
+                    if not extraction_result:
+                        raise Exception("Extraction result not found")
+                    client_metadata = extraction_result.get('clientMetadata', {})
+                    
+                    with st.spinner("Enriching document with external metadata and applying labeling rules..."):
+                        labeling_result = label_document(
+                            LABELING_API_BASE_URL, st.session_state.auth_token, labeling_document_id,
+                            document_class, probability, client_metadata
+                        )
+                        st.session_state.labeling_result = labeling_result
+                    
+                    label_path = labeling_result.get('labelPath', 'N/A')
+                    enriched_client_metadata = labeling_result.get('clientMetadata', {})
+                    internal_metadata = enriched_client_metadata.get('internal', {})
+                    external_metadata = enriched_client_metadata.get('external', {})
+                    
+                    display_success_with_icon("Document labeled and enriched successfully!")
+                    
+                    st.markdown(f"""
+                    <div style="margin: 1rem 0 1.5rem 0;">
+                        <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Category</p>
+                        <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    col_label1, col_label2 = st.columns(2)
+                    with col_label1:
+                        st.markdown("##### Internal Metadata")
+                        st.json(internal_metadata)
+                    with col_label2:
+                        st.markdown("##### External Metadata")
+                        st.json(external_metadata if external_metadata else {"message": "No external metadata found"})
+                    
+                    st.markdown("---")
+                    display_success_with_icon("Document Labeling Completed Successfully")
+                    
+                    # Show download button as part of processing results
+                    labeling_document_id_for_download = labeling_document_id
+                    
+                    # Document Path with Download Button
+                    col_path, col_download = st.columns([5, 1])
+                    with col_path:
+                        st.markdown(f"""
+                        <div style="margin: 1rem 0 1.5rem 0;">
+                            <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Path</p>
+                            <p style="font-size: 1rem; font-weight: 500; color: #1e3a5f; margin: 0; word-break: break-all; line-height: 1.6;">{label_path}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col_download:
+                        st.markdown("<div style='margin-top: 2.5rem;'></div>", unsafe_allow_html=True)
+                        
+                        # If file not cached, fetch it first
+                        if not st.session_state.downloaded_file_data or not st.session_state.downloaded_file_name:
+                            try:
+                                with st.spinner("Preparing download..."):
+                                    file_content, filename = download_document(
+                                        CORE_API_BASE_URL,
+                                        st.session_state.auth_token,
+                                        AGENT_ID,
+                                        labeling_document_id_for_download,
+                                        st.session_state.model_name,
+                                        "input"
+                                    )
+                                    st.session_state.downloaded_file_data = file_content
+                                    st.session_state.downloaded_file_name = filename
+                            except Exception as e:
+                                st.error(f"**Download failed**: {str(e)}")
+                        
+                        # Show download button if file data is available
+                        if st.session_state.downloaded_file_data and st.session_state.downloaded_file_name:
+                            st.download_button(
+                                label="📥 Download",
+                                data=st.session_state.downloaded_file_data,
+                                file_name=st.session_state.downloaded_file_name,
+                                mime="application/octet-stream",
+                                key="save_input_file_persistent"
+                            )
+                    
+                except Exception as e:
+                    display_error(str(e), "Labeling & Data Output")
+                    st.stop()
+    
+    # Show cached results when not actively processing (e.g., after download button click)
+    if not process_button and st.session_state.labeling_result and st.session_state.document_id:
         st.markdown("---")
         st.markdown("### Processing Pipeline")
         st.markdown("---")
@@ -717,41 +1010,19 @@ def main():
             st.markdown("#### Step 1: Integrity Check & Document Conversion")
             
             st.markdown("##### 1.1 Integrity Check")
-            try:
-                with st.spinner("Validating document structure and integrity..."):
-                    integrity_result = check_integrity(CORE_API_BASE_URL, st.session_state.auth_token, document_id)
-                    st.session_state.integrity_status = integrity_result
-                
-                status = integrity_result.get('status', '').lower()
+            if st.session_state.integrity_status:
+                status = st.session_state.integrity_status.get('status', '').lower()
                 if status == 'valid' or status == 'v':
                     display_success_with_icon("Document integrity check passed!")
                 else:
-                    error_msg = integrity_result.get('message', 'Document validation failed')
-                    display_error(error_msg, "Integrity Check")
-                    st.warning("**Integrity check failed. Pipeline stopped.**")
-                    st.stop()
-                    
-            except Exception as e:
-                display_error(str(e), "Integrity Check")
-                st.stop()
+                    error_msg = st.session_state.integrity_status.get('message', 'Document validation failed')
+                    st.error(f"**Integrity Check**: {error_msg}")
             
             st.markdown("---")
             
             st.markdown("##### 1.2 Document Conversion")
-            try:
-                with st.spinner("Converting document to Markdown format..."):
-                    conversion_result = convert_document(CORE_API_BASE_URL, st.session_state.auth_token, document_id)
-                    markdown_content = conversion_result.get('markdownContent', '')
-                    st.session_state.markdown_content = markdown_content
-                
-                if markdown_content:
-                    display_success_with_icon("Document converted to Markdown successfully!")
-                else:
-                    raise Exception("No markdown content in response")
-                    
-            except Exception as e:
-                display_error(str(e), "Document Conversion")
-                st.stop()
+            if st.session_state.markdown_content:
+                display_success_with_icon("Document converted to Markdown successfully!")
         
         st.markdown("---")
         
@@ -759,42 +1030,14 @@ def main():
             st.markdown("#### Step 2: Value Extraction & Document Classification")
             
             st.markdown("##### 2.1 Value Extraction")
-            try:
-                with st.spinner("Extracting structured fields and metadata..."):
-                    # User-specified keys logic - commented out (using auto-extraction only)
-                    # user_keys_list = None
-                    # if extraction_mode == "user_specified" and user_keys_input:
-                    #     user_keys_list = [key.strip() for key in user_keys_input.split(',') if key.strip()]
-                    
-                    extraction_result = extract_values(
-                        CLASSIFICATION_API_BASE_URL, st.session_state.auth_token, markdown_content, 
-                        extraction_mode, None, document_id
-                    )
-                    st.session_state.extracted_data = extraction_result
-                
-                extracted_fields = extraction_result.get('extractedFields', {})
-                client_metadata = extraction_result.get('clientMetadata', {})
-                
+            if st.session_state.extracted_data:
                 display_success_with_icon("Value extraction completed!")
-                    
-            except Exception as e:
-                display_error(str(e), "Value Extraction")
-                st.stop()
             
             st.markdown("---")
             
             st.markdown("##### 2.2 Document Classification")
-            try:
-                with st.spinner("Classifying document using AI..."):
-                    classification_result = classify_document(
-                        CLASSIFICATION_API_BASE_URL, st.session_state.auth_token, extracted_fields, client_metadata, document_id
-                    )
-                    st.session_state.classification_result = classification_result
-                
-                document_class = classification_result.get('documentClass', 'Unknown')
-                probability = classification_result.get('probabilityScore', 0.0)
-                classification_document_id = classification_result.get('documentId', document_id)
-                
+            if st.session_state.classification_result:
+                document_class = st.session_state.classification_result.get('documentClass', 'Unknown')
                 display_success_with_icon("Document classified successfully!")
                 
                 st.markdown(f"""
@@ -803,43 +1046,17 @@ def main():
                     <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
                 </div>
                 """, unsafe_allow_html=True)
-                
-            except Exception as e:
-                display_error(str(e), "Document Classification")
-                st.stop()
         
         st.markdown("---")
         
         with st.container():
             st.markdown("#### Step 3: Labeling & Data Output")
-            try:
+            if st.session_state.labeling_result:
                 classification_result = st.session_state.classification_result
-                if not classification_result:
-                    raise Exception("Classification result not found")
+                document_class = classification_result.get('documentClass', 'Unknown') if classification_result else 'Unknown'
                 
-                document_class = classification_result.get('documentClass', 'Unknown')
-                probability = classification_result.get('probabilityScore', 0.0)
-                
-                labeling_document_id = classification_result.get('documentId')
-                if not labeling_document_id:
-                    labeling_document_id = document_id
-                    if not labeling_document_id:
-                        raise Exception("Document ID not found")
-                
-                extraction_result = st.session_state.extracted_data
-                if not extraction_result:
-                    raise Exception("Extraction result not found")
-                client_metadata = extraction_result.get('clientMetadata', {})
-                
-                with st.spinner("Enriching document with external metadata and applying labeling rules..."):
-                    labeling_result = label_document(
-                        LABELING_API_BASE_URL, st.session_state.auth_token, labeling_document_id,
-                        document_class, probability, client_metadata
-                    )
-                    st.session_state.labeling_result = labeling_result
-                
-                label_path = labeling_result.get('labelPath', 'N/A')
-                enriched_client_metadata = labeling_result.get('clientMetadata', {})
+                label_path = st.session_state.labeling_result.get('labelPath', 'N/A')
+                enriched_client_metadata = st.session_state.labeling_result.get('clientMetadata', {})
                 internal_metadata = enriched_client_metadata.get('internal', {})
                 external_metadata = enriched_client_metadata.get('external', {})
                 
@@ -849,13 +1066,6 @@ def main():
                 <div style="margin: 1rem 0 1.5rem 0;">
                     <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Category</p>
                     <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                st.markdown(f"""
-                <div style="margin: 1rem 0 1.5rem 0;">
-                    <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Path</p>
-                    <p style="font-size: 1rem; font-weight: 500; color: #1e3a5f; margin: 0; word-break: break-all; line-height: 1.6;">{label_path}</p>
                 </div>
                 """, unsafe_allow_html=True)
                 
@@ -870,9 +1080,51 @@ def main():
                 st.markdown("---")
                 display_success_with_icon("Document Labeling Completed Successfully")
                 
-            except Exception as e:
-                display_error(str(e), "Labeling & Data Output")
-                st.stop()
+                # Show download button as part of processing results
+                labeling_document_id = None
+                if st.session_state.classification_result:
+                    labeling_document_id = st.session_state.classification_result.get('documentId')
+                if not labeling_document_id:
+                    labeling_document_id = st.session_state.document_id
+                
+                # Document Path with Download Button
+                col_path, col_download = st.columns([5, 1])
+                with col_path:
+                    st.markdown(f"""
+                    <div style="margin: 1rem 0 1.5rem 0;">
+                        <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Path</p>
+                        <p style="font-size: 1rem; font-weight: 500; color: #1e3a5f; margin: 0; word-break: break-all; line-height: 1.6;">{label_path}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with col_download:
+                    st.markdown("<div style='margin-top: 2.5rem;'></div>", unsafe_allow_html=True)
+                    
+                    # If file not cached, fetch it first
+                    if not st.session_state.downloaded_file_data or not st.session_state.downloaded_file_name:
+                        try:
+                            with st.spinner("Preparing download..."):
+                                file_content, filename = download_document(
+                                    CORE_API_BASE_URL,
+                                    st.session_state.auth_token,
+                                    AGENT_ID,
+                                    labeling_document_id,
+                                    st.session_state.model_name,
+                                    "input"
+                                )
+                                st.session_state.downloaded_file_data = file_content
+                                st.session_state.downloaded_file_name = filename
+                        except Exception as e:
+                            st.error(f"**Download failed**: {str(e)}")
+                    
+                    # Show download button if file data is available
+                    if st.session_state.downloaded_file_data and st.session_state.downloaded_file_name:
+                        st.download_button(
+                            label="📥 Download",
+                            data=st.session_state.downloaded_file_data,
+                            file_name=st.session_state.downloaded_file_name,
+                            mime="application/octet-stream",
+                            key="save_input_file_persistent"
+                        )
     
     if st.session_state.errors:
         st.markdown("---")
