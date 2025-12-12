@@ -9,6 +9,8 @@ import json
 import os
 import re
 import base64
+import zipfile
+import io
 from typing import Optional, Dict, Any, Tuple
 
 # Hardcoded Agent ID
@@ -191,18 +193,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-if 'document_id' not in st.session_state:
-    st.session_state.document_id = None
-if 'integrity_status' not in st.session_state:
-    st.session_state.integrity_status = None
-if 'markdown_content' not in st.session_state:
-    st.session_state.markdown_content = None
-if 'extracted_data' not in st.session_state:
-    st.session_state.extracted_data = None
-if 'classification_result' not in st.session_state:
-    st.session_state.classification_result = None
-if 'labeling_result' not in st.session_state:
-    st.session_state.labeling_result = None
+# Session state for multiple files - using dictionaries keyed by file name
+if 'files_data' not in st.session_state:
+    st.session_state.files_data = {}  # {filename: {document_id, integrity_status, markdown_content, extracted_data, classification_result, labeling_result, errors, status}}
 if 'errors' not in st.session_state:
     st.session_state.errors = []
 if 'auth_token' not in st.session_state:
@@ -213,12 +206,14 @@ if 'is_authenticated' not in st.session_state:
     st.session_state.is_authenticated = False
 if 'model_name' not in st.session_state:
     st.session_state.model_name = ""
-if 'downloaded_file_data' not in st.session_state:
-    st.session_state.downloaded_file_data = None
-if 'downloaded_file_name' not in st.session_state:
-    st.session_state.downloaded_file_name = None
 if 'show_processing_steps' not in st.session_state:
     st.session_state.show_processing_steps = False
+if 'previous_uploaded_files' not in st.session_state:
+    st.session_state.previous_uploaded_files = None
+if 'file_uploader_key' not in st.session_state:
+    st.session_state.file_uploader_key = 0
+if 'cached_file_downloads' not in st.session_state:
+    st.session_state.cached_file_downloads = {}  # {document_id: (file_content, filename)}
 
 
 def display_success_with_icon(message: str):
@@ -309,12 +304,19 @@ def authenticate_user(api_base_url: str, user_email: str, password: str) -> Opti
 
 def get_step_status(step_key):
     """Get status for a pipeline step"""
+    if not st.session_state.files_data:
+        return 'pending'
+    
+    files_data = st.session_state.files_data
     if step_key == 'integrity_conversion':
-        return 'completed' if (st.session_state.integrity_status and st.session_state.markdown_content) else 'pending'
+        completed = sum(1 for f in files_data.values() if f.get('integrity_status') and f.get('markdown_content'))
+        return 'completed' if completed > 0 else 'pending'
     elif step_key == 'extraction_classification':
-        return 'completed' if (st.session_state.extracted_data and st.session_state.classification_result) else 'pending'
+        completed = sum(1 for f in files_data.values() if f.get('extracted_data') and f.get('classification_result'))
+        return 'completed' if completed > 0 else 'pending'
     elif step_key == 'labeling':
-        return 'completed' if st.session_state.labeling_result else 'pending'
+        completed = sum(1 for f in files_data.values() if f.get('labeling_result'))
+        return 'completed' if completed > 0 else 'pending'
     return 'pending'
 
 
@@ -681,14 +683,7 @@ def main():
         st.markdown("---")
         
         if st.button("Clear All Results", use_container_width=True, type="secondary"):
-            st.session_state.document_id = None
-            st.session_state.integrity_status = None
-            st.session_state.markdown_content = None
-            st.session_state.extracted_data = None
-            st.session_state.classification_result = None
-            st.session_state.labeling_result = None
-            st.session_state.downloaded_file_data = None
-            st.session_state.downloaded_file_name = None
+            st.session_state.files_data = {}
             st.session_state.show_processing_steps = False
             clear_errors()
             st.rerun()
@@ -699,45 +694,76 @@ def main():
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        uploaded_file = st.file_uploader(
-            "**Choose a document to process**",
+        uploaded_files = st.file_uploader(
+            "**Choose one or more documents to process**",
             type=['pdf', 'xlsx', 'xls', 'csv'],
-            help="Supported formats: PDF, Excel (.xlsx, .xls), CSV"
+            help="Supported formats: PDF, Excel (.xlsx, .xls), CSV. You can select multiple files.",
+            accept_multiple_files=True,
+            key=f"file_uploader_{st.session_state.file_uploader_key}"
         )
         
-        if uploaded_file:
-            file_size_mb = uploaded_file.size / (1024 * 1024)
-            st.info(f"**File**: {uploaded_file.name} | **Size**: {file_size_mb:.2f} MB")
+        # Check if files have changed and clear results/reset uploader if they have
+        current_file_names = None
+        if uploaded_files:
+            current_file_names = tuple(sorted([f.name for f in uploaded_files]))
+        
+        # If files have changed (including when files are removed), clear all results and reset uploader
+        files_changed = False
+        should_reset_uploader = False
+        
+        if st.session_state.previous_uploaded_files is not None:
+            if current_file_names != st.session_state.previous_uploaded_files:
+                # Files have changed, clear all results
+                st.session_state.files_data = {}
+                st.session_state.show_processing_steps = False
+                clear_errors()
+                files_changed = True
+                
+                # Check if this is a completely new selection (no overlap with previous)
+                # If so, reset the uploader to show only the new files
+                if current_file_names is not None:
+                    previous_set = set(st.session_state.previous_uploaded_files)
+                    current_set = set(current_file_names)
+                    # If there's no overlap, it's a new selection - reset uploader
+                    if not previous_set.intersection(current_set) and len(current_set) > 0:
+                        should_reset_uploader = True
+        elif current_file_names is None and st.session_state.files_data:
+            # Files were cleared (went from having files to no files)
+            st.session_state.files_data = {}
+            st.session_state.show_processing_steps = False
+            clear_errors()
+            files_changed = True
+        
+        # Reset uploader if needed
+        if should_reset_uploader:
+            st.session_state.file_uploader_key += 1
+            st.session_state.previous_uploaded_files = current_file_names
+            st.rerun()
+        
+        # Update previous uploaded files (only if files didn't change, to avoid double update)
+        if not files_changed:
+            st.session_state.previous_uploaded_files = current_file_names
+        
+        if uploaded_files:
+            col_info, col_clear = st.columns([4, 1])
+            with col_info:
+                st.info(f"**{len(uploaded_files)} file(s) selected:**")
+            with col_clear:
+                if st.button("Clear", key="clear_files_button", use_container_width=True):
+                    st.session_state.file_uploader_key += 1
+                    st.session_state.previous_uploaded_files = None
+                    st.session_state.files_data = {}
+                    st.session_state.show_processing_steps = False
+                    clear_errors()
+                    st.rerun()
         
         st.markdown("---")
-        
-        # Extraction mode dropdown - commented out (using auto-extraction only)
-        # extraction_mode_options = {
-        #     "Auto-Extraction Mode": "automatic",
-        #     "User specified Mode": "user_specified"
-        # }
-        # 
-        # selected_label = st.selectbox(
-        #     "**Extraction Mode**",
-        #     options=list(extraction_mode_options.keys()),
-        #     help="Choose automatic extraction or specify keys manually"
-        # )
-        # 
-        # extraction_mode = extraction_mode_options[selected_label]
-        # 
-        # user_keys_input = None
-        # if extraction_mode == "user_specified":
-        #     user_keys_input = st.text_input(
-        #         "**User Keys** (comma-separated)",
-        #         placeholder="e.g., Invoice_no, Amount, Account_number",
-        #         help="Enter keys to extract, separated by commas"
-        #     )
         
         # Always use automatic extraction mode
         extraction_mode = "automatic"
         user_keys_input = None
         
-        process_button = st.button("Process Document", type="primary", use_container_width=True)
+        process_button = st.button("Process Documents", type="primary", use_container_width=True)
     
     with col2:
         st.markdown("### Quick Info")
@@ -747,6 +773,11 @@ def main():
         - Excel Files (.xlsx, .xls)
         - CSV Files
         
+        **Multiple Files:**
+        - Select multiple files to process
+        - Files are processed sequentially through each step
+        - Failed files are skipped in subsequent steps
+        
         **Pipeline Steps:**
         1. Integrity Check & Document Conversion
         2. Extraction & Classification
@@ -755,376 +786,450 @@ def main():
     
     if process_button:
         # Reset all states when starting new processing
-        st.session_state.document_id = None
-        st.session_state.integrity_status = None
-        st.session_state.markdown_content = None
-        st.session_state.extracted_data = None
-        st.session_state.classification_result = None
-        st.session_state.labeling_result = None
-        st.session_state.downloaded_file_data = None
-        st.session_state.downloaded_file_name = None
+        st.session_state.files_data = {}
         st.session_state.show_processing_steps = False
+        st.session_state.cached_file_downloads = {}  # Clear download cache
         clear_errors()
         
-        if not uploaded_file:
-            st.error("**Please upload a file first!**")
+        if not uploaded_files or len(uploaded_files) == 0:
+            st.error("**Please upload at least one file first!**")
             return
         
         if not st.session_state.is_authenticated or not st.session_state.auth_token:
             st.error("**Authentication required!**")
             return
         
-        # Set show_processing_steps to True now that we're starting processing
-        st.session_state.show_processing_steps = True
+        # Validate all files first
+        valid_files = []
+        for uploaded_file in uploaded_files:
+            file_name = uploaded_file.name
+            file_extension = os.path.splitext(file_name)[1].lower()
+            if file_extension not in ['.pdf', '.xlsx', '.xls', '.csv']:
+                st.warning(f"**Skipping {file_name}**: Unsupported file type {file_extension}")
+                continue
+            valid_files.append(uploaded_file)
         
-        file_name = uploaded_file.name
-        file_size = uploaded_file.size
-        file_extension = os.path.splitext(file_name)[1].lower()
-        
-        if file_extension not in ['.pdf', '.xlsx', '.xls', '.csv']:
-            st.error(f"**Unsupported file type**: {file_extension}")
+        if not valid_files:
+            st.error("**No valid files to process!**")
             return
         
-        with st.spinner("Uploading document..."):
-            try:
-                uploaded_file.seek(0)
-                document_id = upload_document(
-                    CORE_API_BASE_URL, st.session_state.auth_token, uploaded_file, 
-                    file_name, file_size, file_extension, st.session_state.user_id
-                )
-                st.session_state.document_id = document_id
-                # Store model_name (currently empty string, but may be used later)
-                st.session_state.model_name = ""
-            except Exception as e:
-                display_error(str(e), "Document Upload")
-                st.stop()
+        # Initialize file data structures
+        for uploaded_file in valid_files:
+            file_name = uploaded_file.name
+            st.session_state.files_data[file_name] = {
+                'document_id': None,
+                'integrity_status': None,
+                'markdown_content': None,
+                'extracted_data': None,
+                'classification_result': None,
+                'labeling_result': None,
+                'errors': [],
+                'status': 'pending',  # pending, step1_complete, step2_complete, step3_complete, failed
+                'file_object': uploaded_file
+            }
+        
+        # Set show_processing_steps to True now that we're starting processing
+        st.session_state.show_processing_steps = True
         
         # Show processing steps during active processing
         st.markdown("---")
         st.markdown("### Processing Pipeline")
+        st.markdown(f"**Processing {len(valid_files)} file(s) sequentially through each sub-step**")
         st.markdown("---")
         
-        with st.container():
-                st.markdown("#### Step 1: Integrity Check & Document Conversion")
-                
-                st.markdown("##### 1.1 Integrity Check")
-                try:
-                    with st.spinner("Validating document structure and integrity..."):
-                        integrity_result = check_integrity(CORE_API_BASE_URL, st.session_state.auth_token, document_id)
-                        st.session_state.integrity_status = integrity_result
-                    
-                    status = integrity_result.get('status', '').lower()
-                    if status == 'valid' or status == 'v':
-                        display_success_with_icon("Document integrity check passed!")
-                    else:
-                        error_msg = integrity_result.get('message', 'Document validation failed')
-                        display_error(error_msg, "Integrity Check")
-                        st.warning("**Integrity check failed. Pipeline stopped.**")
-                        st.stop()
-                        
-                except Exception as e:
-                    display_error(str(e), "Integrity Check")
-                    st.stop()
-                
-                st.markdown("---")
-                
-                st.markdown("##### 1.2 Document Conversion")
-                try:
-                    with st.spinner("Converting document to Markdown format..."):
-                        conversion_result = convert_document(CORE_API_BASE_URL, st.session_state.auth_token, document_id)
-                        markdown_content = conversion_result.get('markdownContent', '')
-                        st.session_state.markdown_content = markdown_content
-                    
-                    if markdown_content:
-                        display_success_with_icon("Document converted to Markdown successfully!")
-                    else:
-                        raise Exception("No markdown content in response")
-                        
-                except Exception as e:
-                    display_error(str(e), "Document Conversion")
-                    st.stop()
+        # SUB-STEP 1.1: Upload all files
+        st.markdown("#### Step 1.1: Document Upload")
+        st.markdown("---")
+        
+        for file_name, file_data in st.session_state.files_data.items():
+            uploaded_file = file_data['file_object']
+            file_size = uploaded_file.size
+            file_extension = os.path.splitext(file_name)[1].lower()
+            
+            try:
+                with st.spinner(f"Uploading {file_name}..."):
+                    uploaded_file.seek(0)
+                    document_id = upload_document(
+                        CORE_API_BASE_URL, st.session_state.auth_token, uploaded_file, 
+                        file_name, file_size, file_extension, st.session_state.user_id
+                    )
+                    file_data['document_id'] = document_id
+                    display_success_with_icon(f"**{file_name}**: Uploaded successfully!")
+            except Exception as e:
+                error_msg = f"Upload failed: {str(e)}"
+                file_data['errors'].append(error_msg)
+                file_data['status'] = 'failed'
+                st.error(f"**{file_name}**: {error_msg}")
         
         st.markdown("---")
         
-        with st.container():
-                st.markdown("#### Step 2: Value Extraction & Document Classification")
+        # SUB-STEP 1.2: Integrity Check all files
+        st.markdown("#### Step 1.2: Integrity Check")
+        st.markdown("---")
+        
+        files_passed_integrity = []
+        for file_name, file_data in st.session_state.files_data.items():
+            if file_data['status'] == 'failed' or not file_data.get('document_id'):
+                continue
+            
+            document_id = file_data['document_id']
+            try:
+                with st.spinner(f"Validating {file_name}..."):
+                    integrity_result = check_integrity(CORE_API_BASE_URL, st.session_state.auth_token, document_id)
+                    file_data['integrity_status'] = integrity_result
                 
-                st.markdown("##### 2.1 Value Extraction")
+                status = integrity_result.get('status', '').lower()
+                if status == 'valid' or status == 'v':
+                    display_success_with_icon(f"**{file_name}**: Integrity check passed!")
+                    files_passed_integrity.append(file_name)
+                else:
+                    error_msg = integrity_result.get('message', 'Document validation failed')
+                    file_data['errors'].append(f"Integrity Check: {error_msg}")
+                    file_data['status'] = 'failed'
+                    st.error(f"**{file_name}**: {error_msg}")
+            except Exception as e:
+                error_msg = f"Integrity Check failed: {str(e)}"
+                file_data['errors'].append(error_msg)
+                file_data['status'] = 'failed'
+                st.error(f"**{file_name}**: {error_msg}")
+        
+        st.markdown("---")
+        
+        # SUB-STEP 1.3: Convert all files that passed integrity
+        st.markdown("#### Step 1.3: Document Conversion")
+        st.markdown("---")
+        
+        files_passed_step1 = []
+        for file_name in files_passed_integrity:
+            file_data = st.session_state.files_data[file_name]
+            document_id = file_data['document_id']
+            
+            try:
+                with st.spinner(f"Converting {file_name} to Markdown..."):
+                    conversion_result = convert_document(CORE_API_BASE_URL, st.session_state.auth_token, document_id)
+                    markdown_content = conversion_result.get('markdownContent', '')
+                    file_data['markdown_content'] = markdown_content
+                
+                if markdown_content:
+                    display_success_with_icon(f"**{file_name}**: Converted to Markdown successfully!")
+                    file_data['status'] = 'step1_complete'
+                    files_passed_step1.append(file_name)
+                else:
+                    raise Exception("No markdown content in response")
+            except Exception as e:
+                error_msg = f"Document Conversion failed: {str(e)}"
+                file_data['errors'].append(error_msg)
+                file_data['status'] = 'failed'
+                st.error(f"**{file_name}**: {error_msg}")
+        
+        st.markdown("---")
+        
+        # SUB-STEP 2.1: Extract values from all files that passed step 1
+        if files_passed_step1:
+            st.markdown("#### Step 2.1: Value Extraction")
+            st.markdown(f"**Processing {len(files_passed_step1)} file(s) that passed Step 1**")
+            st.markdown("---")
+            
+            files_passed_extraction = []
+            for file_name in files_passed_step1:
+                file_data = st.session_state.files_data[file_name]
+                document_id = file_data['document_id']
+                markdown_content = file_data['markdown_content']
+                
                 try:
-                    with st.spinner("Extracting structured fields and metadata..."):
-                        # User-specified keys logic - commented out (using auto-extraction only)
-                        # user_keys_list = None
-                        # if extraction_mode == "user_specified" and user_keys_input:
-                        #     user_keys_list = [key.strip() for key in user_keys_input.split(',') if key.strip()]
-                        
+                    with st.spinner(f"Extracting values from {file_name}..."):
                         extraction_result = extract_values(
                             CLASSIFICATION_API_BASE_URL, st.session_state.auth_token, markdown_content, 
                             extraction_mode, None, document_id
                         )
-                        st.session_state.extracted_data = extraction_result
+                        file_data['extracted_data'] = extraction_result
                     
+                    display_success_with_icon(f"**{file_name}**: Value extraction completed!")
+                    files_passed_extraction.append(file_name)
+                except Exception as e:
+                    error_msg = f"Value Extraction failed: {str(e)}"
+                    file_data['errors'].append(error_msg)
+                    file_data['status'] = 'failed'
+                    st.error(f"**{file_name}**: {error_msg}")
+            
+            st.markdown("---")
+            
+            # SUB-STEP 2.2: Classify all files that passed extraction
+            if files_passed_extraction:
+                st.markdown("#### Step 2.2: Document Classification")
+                st.markdown("---")
+                
+                files_passed_step2 = []
+                for file_name in files_passed_extraction:
+                    file_data = st.session_state.files_data[file_name]
+                    document_id = file_data['document_id']
+                    extraction_result = file_data['extracted_data']
                     extracted_fields = extraction_result.get('extractedFields', {})
                     client_metadata = extraction_result.get('clientMetadata', {})
                     
-                    display_success_with_icon("Value extraction completed!")
+                    try:
+                        with st.spinner(f"Classifying {file_name}..."):
+                            classification_result = classify_document(
+                                CLASSIFICATION_API_BASE_URL, st.session_state.auth_token, extracted_fields, client_metadata, document_id
+                            )
+                            file_data['classification_result'] = classification_result
                         
-                except Exception as e:
-                    display_error(str(e), "Value Extraction")
-                    st.stop()
+                        document_class = classification_result.get('documentClass', 'Unknown')
+                        display_success_with_icon(f"**{file_name}**: Classified as **{document_class}**")
+                        file_data['status'] = 'step2_complete'
+                        files_passed_step2.append(file_name)
+                    except Exception as e:
+                        error_msg = f"Document Classification failed: {str(e)}"
+                        file_data['errors'].append(error_msg)
+                        file_data['status'] = 'failed'
+                        st.error(f"**{file_name}**: {error_msg}")
                 
                 st.markdown("---")
                 
-                st.markdown("##### 2.2 Document Classification")
-                try:
-                    with st.spinner("Classifying document using AI..."):
-                        classification_result = classify_document(
-                            CLASSIFICATION_API_BASE_URL, st.session_state.auth_token, extracted_fields, client_metadata, document_id
-                        )
-                        st.session_state.classification_result = classification_result
+                # SUB-STEP 3: Label all files that passed step 2
+                if files_passed_step2:
+                    st.markdown("#### Step 3: Labeling & Data Output")
+                    st.markdown(f"**Processing {len(files_passed_step2)} file(s) that passed Step 2**")
+                    st.markdown("---")
                     
-                    document_class = classification_result.get('documentClass', 'Unknown')
-                    probability = classification_result.get('probabilityScore', 0.0)
-                    classification_document_id = classification_result.get('documentId', document_id)
-                    
-                    display_success_with_icon("Document classified successfully!")
-                    
-                    st.markdown(f"""
-                    <div style="margin: 1rem 0 1.5rem 0;">
-                        <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Category</p>
-                        <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                except Exception as e:
-                    display_error(str(e), "Document Classification")
-                    st.stop()
-        
-        st.markdown("---")
-        
-        with st.container():
-                st.markdown("#### Step 3: Labeling & Data Output")
-                try:
-                    classification_result = st.session_state.classification_result
-                    if not classification_result:
-                        raise Exception("Classification result not found")
-                    
-                    document_class = classification_result.get('documentClass', 'Unknown')
-                    probability = classification_result.get('probabilityScore', 0.0)
-                    
-                    labeling_document_id = classification_result.get('documentId')
-                    if not labeling_document_id:
-                        labeling_document_id = document_id
-                        if not labeling_document_id:
-                            raise Exception("Document ID not found")
-                    
-                    extraction_result = st.session_state.extracted_data
-                    if not extraction_result:
-                        raise Exception("Extraction result not found")
-                    client_metadata = extraction_result.get('clientMetadata', {})
-                    
-                    with st.spinner("Enriching document with external metadata and applying labeling rules..."):
-                        labeling_result = label_document(
-                            LABELING_API_BASE_URL, st.session_state.auth_token, labeling_document_id,
-                            document_class, probability, client_metadata
-                        )
-                        st.session_state.labeling_result = labeling_result
-                    
-                    label_path = labeling_result.get('labelPath', 'N/A')
-                    enriched_client_metadata = labeling_result.get('clientMetadata', {})
-                    internal_metadata = enriched_client_metadata.get('internal', {})
-                    external_metadata = enriched_client_metadata.get('external', {})
-                    
-                    display_success_with_icon("Document labeled and enriched successfully!")
-                    
-                    st.markdown(f"""
-                    <div style="margin: 1rem 0 1.5rem 0;">
-                        <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Category</p>
-                        <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    col_label1, col_label2 = st.columns(2)
-                    with col_label1:
-                        st.markdown("##### Internal Metadata")
-                        st.json(internal_metadata)
-                    with col_label2:
-                        st.markdown("##### External Metadata")
-                        st.json(external_metadata if external_metadata else {"message": "No external metadata found"})
+                    for file_name in files_passed_step2:
+                        file_data = st.session_state.files_data[file_name]
+                        classification_result = file_data['classification_result']
+                        document_id = file_data['document_id']
+                        extraction_result = file_data['extracted_data']
+                        
+                        try:
+                            document_class = classification_result.get('documentClass', 'Unknown')
+                            probability = classification_result.get('probabilityScore', 0.0)
+                            
+                            labeling_document_id = classification_result.get('documentId')
+                            if not labeling_document_id:
+                                labeling_document_id = document_id
+                            
+                            client_metadata = extraction_result.get('clientMetadata', {})
+                            
+                            with st.spinner(f"Labeling {file_name}..."):
+                                labeling_result = label_document(
+                                    LABELING_API_BASE_URL, st.session_state.auth_token, labeling_document_id,
+                                    document_class, probability, client_metadata
+                                )
+                                file_data['labeling_result'] = labeling_result
+                            
+                            label_path = labeling_result.get('labelPath', 'N/A')
+                            display_success_with_icon(f"**{file_name}**: Labeled and enriched successfully!")
+                            file_data['status'] = 'step3_complete'
+                        except Exception as e:
+                            error_msg = f"Labeling failed: {str(e)}"
+                            file_data['errors'].append(error_msg)
+                            file_data['status'] = 'failed'
+                            st.error(f"**{file_name}**: {error_msg}")
                     
                     st.markdown("---")
-                    display_success_with_icon("Document Labeling Completed Successfully")
+    
+    # Show processing pipeline results after processing completes (so they don't disappear on download clicks)
+    # This shows the step-by-step results for each file
+    if st.session_state.files_data and not process_button:
+        # Check if any processing has been done
+        has_processing_results = any(
+            f.get('document_id') or f.get('integrity_status') or f.get('markdown_content') 
+            or f.get('extracted_data') or f.get('classification_result') or f.get('labeling_result')
+            for f in st.session_state.files_data.values()
+        )
+        
+        if has_processing_results:
+            st.markdown("---")
+            st.markdown("### Processing Pipeline Results")
+            st.markdown("---")
+            
+            # Show results for each file by step
+            for file_name, file_data in st.session_state.files_data.items():
+                # Only show if file has any processing results
+                if file_data.get('document_id'):
+                    with st.expander(f"📄 **{file_name}** - Processing Steps", expanded=False):
+                        # Step 1 Results
+                        if file_data.get('integrity_status') or file_data.get('markdown_content'):
+                            st.markdown("#### Step 1: Integrity Check & Document Conversion")
+                            
+                            if file_data.get('integrity_status'):
+                                status = file_data['integrity_status'].get('status', '').lower()
+                                if status == 'valid' or status == 'v':
+                                    display_success_with_icon("Document integrity check passed!")
+                                else:
+                                    error_msg = file_data['integrity_status'].get('message', 'Document validation failed')
+                                    st.error(f"**Integrity Check**: {error_msg}")
+                            
+                            if file_data.get('markdown_content'):
+                                display_success_with_icon("Document converted to Markdown successfully!")
+                        
+                        # Step 2 Results
+                        if file_data.get('extracted_data') or file_data.get('classification_result'):
+                            st.markdown("---")
+                            st.markdown("#### Step 2: Value Extraction & Document Classification")
+                            
+                            if file_data.get('extracted_data'):
+                                display_success_with_icon("Value extraction completed!")
+                            
+                            if file_data.get('classification_result'):
+                                document_class = file_data['classification_result'].get('documentClass', 'Unknown')
+                                display_success_with_icon("Document classified successfully!")
+                                st.markdown(f"""
+                                <div style="margin: 1rem 0 1.5rem 0;">
+                                    <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Category</p>
+                                    <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                        
+                        # Step 3 Results
+                        if file_data.get('labeling_result'):
+                            st.markdown("---")
+                            st.markdown("#### Step 3: Labeling & Data Output")
+                            display_success_with_icon("Document labeled and enriched successfully!")
+                        
+                        # Show errors if any
+                        if file_data.get('errors'):
+                            st.markdown("---")
+                            st.error("**Errors encountered for this file:**")
+                            for error in file_data['errors']:
+                                st.error(f"• {error}")
+    
+    # Show summary, download all, and detailed results whenever we have processed files
+    # Show them both during active processing and after, but keep them stable on download clicks
+    if st.session_state.files_data:
+        st.markdown("---")
+        st.markdown("### Processing Summary")
+        total_files = len(st.session_state.files_data)
+        completed_files = sum(1 for f in st.session_state.files_data.values() if f['status'] == 'step3_complete')
+        failed_files = sum(1 for f in st.session_state.files_data.values() if f['status'] == 'failed')
+        
+        col_sum1, col_sum2, col_sum3 = st.columns(3)
+        with col_sum1:
+            st.metric("Total Files", total_files)
+        with col_sum2:
+            st.metric("Completed", completed_files, delta=f"{completed_files}/{total_files}")
+        with col_sum3:
+            st.metric("Failed", failed_files, delta=f"{failed_files}/{total_files}" if failed_files > 0 else None)
+        
+        # Get completed file names
+        completed_file_names = [name for name, data in st.session_state.files_data.items() if data['status'] == 'step3_complete']
+        
+        # Detailed Results for each file (show first, before zip creation)
+        if completed_file_names:
+            st.markdown("---")
+            st.markdown("### Detailed Results")
+            st.markdown("---")
+            
+            # First, render all expanders immediately with metadata (no downloads yet)
+            for file_name in completed_file_names:
+                file_data = st.session_state.files_data[file_name]
+                classification_result = file_data.get('classification_result')
+                labeling_result = file_data.get('labeling_result')
+                
+                with st.expander(f"📄 **{file_name}** - Detailed Results", expanded=False):
+                    if classification_result:
+                        document_class = classification_result.get('documentClass', 'Unknown')
+                        probability = classification_result.get('probabilityScore', 0.0)
+                        
+                        st.markdown(f"""
+                        <div style="margin: 1rem 0 1.5rem 0;">
+                            <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Category</p>
+                            <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
+                            <p style="font-size: 0.9rem; color: #6b7280; margin: 0.25rem 0;">Confidence: {probability:.2%}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
                     
-                    # Show download button as part of processing results
-                    labeling_document_id_for_download = labeling_document_id
-                    
-                    # Document Path with Download Button
-                    col_path, col_download = st.columns([5, 1])
-                    with col_path:
+                    if labeling_result:
+                        label_path = labeling_result.get('labelPath', 'N/A')
+                        enriched_client_metadata = labeling_result.get('clientMetadata', {})
+                        internal_metadata = enriched_client_metadata.get('internal', {})
+                        external_metadata = enriched_client_metadata.get('external', {})
+                        
+                        col_label1, col_label2 = st.columns(2)
+                        with col_label1:
+                            st.markdown("##### Internal Metadata")
+                            st.json(internal_metadata)
+                        with col_label2:
+                            st.markdown("##### External Metadata")
+                            st.json(external_metadata if external_metadata else {"message": "No external metadata found"})
+                        
                         st.markdown(f"""
                         <div style="margin: 1rem 0 1.5rem 0;">
                             <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Path</p>
                             <p style="font-size: 1rem; font-weight: 500; color: #1e3a5f; margin: 0; word-break: break-all; line-height: 1.6;">{label_path}</p>
                         </div>
                         """, unsafe_allow_html=True)
-                    with col_download:
-                        st.markdown("<div style='margin-top: 2.5rem;'></div>", unsafe_allow_html=True)
                         
-                        # If file not cached, fetch it first
-                        if not st.session_state.downloaded_file_data or not st.session_state.downloaded_file_name:
-                            try:
-                                with st.spinner("Preparing download..."):
-                                    file_content, filename = download_document(
-                                        CORE_API_BASE_URL,
-                                        st.session_state.auth_token,
-                                        AGENT_ID,
-                                        labeling_document_id_for_download,
-                                        st.session_state.model_name,
-                                        "input"
-                                    )
-                                    st.session_state.downloaded_file_data = file_content
-                                    st.session_state.downloaded_file_name = filename
-                            except Exception as e:
-                                st.error(f"**Download failed**: {str(e)}")
+                        # Individual download button
+                        labeling_document_id = None
+                        if classification_result:
+                            labeling_document_id = classification_result.get('documentId')
+                        if not labeling_document_id:
+                            labeling_document_id = file_data.get('document_id')
                         
-                        # Show download button if file data is available
-                        if st.session_state.downloaded_file_data and st.session_state.downloaded_file_name:
-                            st.download_button(
-                                label="📥 Download",
-                                data=st.session_state.downloaded_file_data,
-                                file_name=st.session_state.downloaded_file_name,
-                                mime="application/octet-stream",
-                                key="save_input_file_persistent"
-                            )
-                    
-                except Exception as e:
-                    display_error(str(e), "Labeling & Data Output")
-                    st.stop()
-    
-    # Show cached results when not actively processing (e.g., after download button click)
-    if not process_button and st.session_state.labeling_result and st.session_state.document_id:
-        st.markdown("---")
-        st.markdown("### Processing Pipeline")
-        st.markdown("---")
-        
-        with st.container():
-            st.markdown("#### Step 1: Integrity Check & Document Conversion")
-            
-            st.markdown("##### 1.1 Integrity Check")
-            if st.session_state.integrity_status:
-                status = st.session_state.integrity_status.get('status', '').lower()
-                if status == 'valid' or status == 'v':
-                    display_success_with_icon("Document integrity check passed!")
-                else:
-                    error_msg = st.session_state.integrity_status.get('message', 'Document validation failed')
-                    st.error(f"**Integrity Check**: {error_msg}")
-            
-            st.markdown("---")
-            
-            st.markdown("##### 1.2 Document Conversion")
-            if st.session_state.markdown_content:
-                display_success_with_icon("Document converted to Markdown successfully!")
-        
-        st.markdown("---")
-        
-        with st.container():
-            st.markdown("#### Step 2: Value Extraction & Document Classification")
-            
-            st.markdown("##### 2.1 Value Extraction")
-            if st.session_state.extracted_data:
-                display_success_with_icon("Value extraction completed!")
-            
-            st.markdown("---")
-            
-            st.markdown("##### 2.2 Document Classification")
-            if st.session_state.classification_result:
-                document_class = st.session_state.classification_result.get('documentClass', 'Unknown')
-                display_success_with_icon("Document classified successfully!")
-                
-                st.markdown(f"""
-                <div style="margin: 1rem 0 1.5rem 0;">
-                    <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Category</p>
-                    <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        with st.container():
-            st.markdown("#### Step 3: Labeling & Data Output")
-            if st.session_state.labeling_result:
-                classification_result = st.session_state.classification_result
-                document_class = classification_result.get('documentClass', 'Unknown') if classification_result else 'Unknown'
-                
-                label_path = st.session_state.labeling_result.get('labelPath', 'N/A')
-                enriched_client_metadata = st.session_state.labeling_result.get('clientMetadata', {})
-                internal_metadata = enriched_client_metadata.get('internal', {})
-                external_metadata = enriched_client_metadata.get('external', {})
-                
-                display_success_with_icon("Document labeled and enriched successfully!")
-                
-                st.markdown(f"""
-                <div style="margin: 1rem 0 1.5rem 0;">
-                    <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Category</p>
-                    <p style="font-size: 1.5rem; font-weight: 600; color: #1e3a5f; margin: 0;">{document_class}</p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                col_label1, col_label2 = st.columns(2)
-                with col_label1:
-                    st.markdown("##### Internal Metadata")
-                    st.json(internal_metadata)
-                with col_label2:
-                    st.markdown("##### External Metadata")
-                    st.json(external_metadata if external_metadata else {"message": "No external metadata found"})
-                
-                st.markdown("---")
-                display_success_with_icon("Document Labeling Completed Successfully")
-                
-                # Show download button as part of processing results
-                labeling_document_id = None
-                if st.session_state.classification_result:
-                    labeling_document_id = st.session_state.classification_result.get('documentId')
-                if not labeling_document_id:
-                    labeling_document_id = st.session_state.document_id
-                
-                # Document Path with Download Button
-                col_path, col_download = st.columns([5, 1])
-                with col_path:
-                    st.markdown(f"""
-                    <div style="margin: 1rem 0 1.5rem 0;">
-                        <p style="font-size: 1rem; color: #6b7280; margin: 0.5rem 0;">Document Path</p>
-                        <p style="font-size: 1rem; font-weight: 500; color: #1e3a5f; margin: 0; word-break: break-all; line-height: 1.6;">{label_path}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                with col_download:
-                    st.markdown("<div style='margin-top: 2.5rem;'></div>", unsafe_allow_html=True)
-                    
-                    # If file not cached, fetch it first
-                    if not st.session_state.downloaded_file_data or not st.session_state.downloaded_file_name:
-                        try:
-                            with st.spinner("Preparing download..."):
-                                file_content, filename = download_document(
-                                    CORE_API_BASE_URL,
-                                    st.session_state.auth_token,
-                                    AGENT_ID,
-                                    labeling_document_id,
-                                    st.session_state.model_name,
-                                    "input"
+                        if labeling_document_id:
+                            # Cache file downloads to avoid re-downloading on reruns
+                            cache_key = f"{labeling_document_id}_{file_name}"
+                            
+                            # Show download button if cached, otherwise show placeholder
+                            if cache_key in st.session_state.cached_file_downloads and st.session_state.cached_file_downloads[cache_key]:
+                                # File is cached, show button immediately
+                                file_content, filename = st.session_state.cached_file_downloads[cache_key]
+                                st.download_button(
+                                    label=f"📥 Download {file_name}",
+                                    data=file_content,
+                                    file_name=filename,
+                                    mime="application/octet-stream",
+                                    key=f"download_individual_{file_name}_{labeling_document_id}"
                                 )
-                                st.session_state.downloaded_file_data = file_content
-                                st.session_state.downloaded_file_name = filename
+                            else:
+                                # File not cached, show placeholder that will be replaced on next rerun
+                                st.info("💾 Preparing download...")
+            
+            # Now download any missing files in the background (this will trigger a rerun)
+            files_to_download = []
+            for file_name in completed_file_names:
+                file_data = st.session_state.files_data[file_name]
+                classification_result = file_data.get('classification_result')
+                labeling_document_id = None
+                if classification_result:
+                    labeling_document_id = classification_result.get('documentId')
+                if not labeling_document_id:
+                    labeling_document_id = file_data.get('document_id')
+                
+                if labeling_document_id:
+                    cache_key = f"{labeling_document_id}_{file_name}"
+                    if cache_key not in st.session_state.cached_file_downloads:
+                        files_to_download.append((file_name, labeling_document_id, cache_key))
+            
+            # Download missing files
+            if files_to_download:
+                # Use a single spinner for all downloads
+                with st.spinner(f"Preparing downloads for {len(files_to_download)} file(s)..."):
+                    for file_name, labeling_document_id, cache_key in files_to_download:
+                        try:
+                            file_content, filename = download_document(
+                                CORE_API_BASE_URL,
+                                st.session_state.auth_token,
+                                AGENT_ID,
+                                labeling_document_id,
+                                st.session_state.model_name,
+                                "input"
+                            )
+                            st.session_state.cached_file_downloads[cache_key] = (file_content, filename)
                         except Exception as e:
-                            st.error(f"**Download failed**: {str(e)}")
-                    
-                    # Show download button if file data is available
-                    if st.session_state.downloaded_file_data and st.session_state.downloaded_file_name:
-                        st.download_button(
-                            label="📥 Download",
-                            data=st.session_state.downloaded_file_data,
-                            file_name=st.session_state.downloaded_file_name,
-                            mime="application/octet-stream",
-                            key="save_input_file_persistent"
-                        )
+                            st.warning(f"Could not download {file_name}: {str(e)}")
+                            st.session_state.cached_file_downloads[cache_key] = None
+                
+                # Rerun to show download buttons
+                st.rerun()
+    
+    # Legacy cached results section - commented out to prevent duplicate displays
+    # The summary and detailed results are now shown above when not actively processing
+    # This prevents re-rendering when download buttons are clicked
+    # if not process_button and st.session_state.files_data:
+    #     st.markdown("---")
+    #     st.markdown("### Processing Results")
+    #     st.markdown("---")
+    #     ... (legacy code removed to prevent duplicates)
     
     if st.session_state.errors:
         st.markdown("---")
