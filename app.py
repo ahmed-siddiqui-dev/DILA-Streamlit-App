@@ -18,7 +18,7 @@ from typing import Optional, Dict, Any, Tuple
 AGENT_ID = "69174f5b808a5f1b07561164"
 
 CORE_API_BASE_URL = "https://intellixcore-develop-64h7qzl6ga-ew.a.run.app"
-CLASSIFICATION_API_BASE_URL = "http://localhost:8082"
+CLASSIFICATION_API_BASE_URL = "https://intellixcore-develop-64h7qzl6ga-ew.a.run.app"
 USER_EMAIL = "moeed.ahmad1@intellixcore1.ai"
 PASSWORD = "Test@1234"
 
