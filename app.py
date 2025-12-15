@@ -19,7 +19,6 @@ AGENT_ID = "69174f5b808a5f1b07561164"
 
 CORE_API_BASE_URL = "http://localhost:8080"
 CLASSIFICATION_API_BASE_URL = "http://localhost:8082"
-LABELING_API_BASE_URL = "http://localhost:8081"
 USER_EMAIL = "moeed.ahmad1@intellixcore1.ai"
 PASSWORD = "Test@1234"
 
@@ -1015,7 +1014,7 @@ def main():
                             
                             with st.spinner(f"Labeling {file_name}..."):
                                 labeling_result = label_document(
-                                    LABELING_API_BASE_URL, st.session_state.auth_token, labeling_document_id,
+                                    CORE_API_BASE_URL, st.session_state.auth_token, labeling_document_id,
                                     document_class, probability, client_metadata
                                 )
                                 file_data['labeling_result'] = labeling_result
