@@ -15,12 +15,12 @@ from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 
 # Hardcoded Agent ID
-AGENT_ID = "69174f5b808a5f1b07561164"
+AGENT_ID = "68e3ccfa9c5249ad1a29aba0"
 
 CORE_API_BASE_URL = "https://intellixcore-develop-64h7qzl6ga-ew.a.run.app"
 CLASSIFICATION_API_BASE_URL = "https://intellixcore-develop-64h7qzl6ga-ew.a.run.app"
-USER_EMAIL = "ahmed.siddiqui@intellixcore.com"
-PASSWORD = "ZXCASD123!a"
+USER_EMAIL = "moeed.ahmad@intellixcore.ai"
+PASSWORD = "Test@1234"
 
 st.set_page_config(
     page_title="RSM Document Intelligence Platform",
